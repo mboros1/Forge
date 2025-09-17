@@ -1,0 +1,29 @@
+{
+  "engine": "prusa-slicer",
+  "inputs": [
+    {
+      "path": "model.stl",
+      "transform": [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+      ]
+    }
+  ],
+  "profile": {
+    "nozzle_mm": 0.4,
+    "layer_h_mm": 0.2,
+    "material": "PLA",
+    "speed_preset": "standard"
+  },
+  "bed": {
+    "size_mm": [220, 220, 250],
+    "origin": "min"
+  },
+  "outputs": {
+    "gcode": "out/job.gcode",
+    "preview": "out/preview.json"
+  }
+}
+
