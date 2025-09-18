@@ -15,5 +15,7 @@ bevy = { version = "0.13", default-features = false, features = [
     "bevy_ui",
     "bevy_text",
     "tonemapping_luts",
+    "multi-threaded",
 ] }
+futures-lite = "2"
 stl_io = "0.7"

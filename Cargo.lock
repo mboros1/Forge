@@ -1706,6 +1706,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bevy",
+ "futures-lite",
  "stl_io",
 ]
 
