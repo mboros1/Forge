@@ -12,4 +12,8 @@ bevy = { version = "0.13", default-features = false, features = [
     "bevy_pbr",
     "bevy_asset",
     "bevy_gizmos",
+    "bevy_ui",
+    "bevy_text",
+    "tonemapping_luts",
 ] }
+stl_io = "0.7"
