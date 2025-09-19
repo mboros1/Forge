@@ -19,10 +19,11 @@ pub struct ForgeViewerPlugin;
 
 impl Plugin for ForgeViewerPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(FpsCounter { avg: 0.0 })
+        app.init_asset::<stl::StlMesh>()
+            .init_asset_loader::<stl::StlLoader>()
+            .insert_resource(FpsCounter { avg: 0.0 })
             .insert_resource(LoadedDefault(false))
             .insert_resource(DragState::default())
-            .insert_resource(LoadingJob::Idle)
             .insert_resource(CurrentModelPath(None))
             .insert_resource(SliceJob::Idle)
             .add_systems(Startup, (camera::setup_camera, spawn_axes_arrows, setup_fps_ui))
@@ -32,14 +33,12 @@ impl Plugin for ForgeViewerPlugin {
                 drag_selected_model,
                 camera::camera_orbit_controls,
                 mouse_pick_select,
+                stl_instantiate_ready,
                 slice_hotkey,
                 poll_slice_job,
                 update_fps_ui,
-                stl_file_drop_loader,
-                schedule_default_load_once,
-                kick_off_loading_job,
-                poll_loading_job,
-                update_loading_ui,
+                stl_file_drop_loader_assets,
+                schedule_default_asset_load_once,
             ));
     }
 }
@@ -175,6 +174,9 @@ struct Selected;
 #[derive(Resource, Default)]
 struct CurrentModelPath(Option<PathBuf>);
 
+#[derive(Component, Clone)]
+struct StlInstance { handle: Handle<stl::StlMesh> }
+
 #[derive(Resource)]
 enum SliceJob {
     Idle,
@@ -212,7 +214,6 @@ fn poll_slice_job(
 
 async fn run_slice_request(model_path: PathBuf) -> anyhow::Result<()> {
     use std::fs;
-    use std::process::Command;
     // Build a simple request using provided model path
     let stem = PathBuf::from(&model_path).file_stem().and_then(|s| s.to_str()).unwrap_or("job").to_string();
     let out_dir = PathBuf::from("out");
@@ -235,190 +236,7 @@ async fn run_slice_request(model_path: PathBuf) -> anyhow::Result<()> {
 }
 
 
-fn kick_off_loading_job(
-    mut commands: Commands,
-    mut job: ResMut<LoadingJob>,
-    overlay_query: Query<Entity, With<LoadingOverlay>>,
-) {
-    // If we have a pending file and no overlay yet, spawn overlay and start task
-    if let LoadingJob::Pending { file } = &*job {
-        // If overlay not present, create it
-        if overlay_query.get_single().is_err() {
-            spawn_loading_overlay(&mut commands, file);
-        }
-        // Start task
-        let file_path = file.clone();
-        let pool = AsyncComputeTaskPool::get();
-        let task: Task<anyhow::Result<(Mesh, (Vec3, Vec3))>> = pool.spawn(async move {
-            // Do sync parse in async pool
-            let res = stl::load_stl_mesh(&file_path);
-            match res {
-                Ok(mesh) => {
-                    // Extract positions to compute bounds
-                    use bevy::render::mesh::VertexAttributeValues;
-                    let positions: Vec<[f32;3]> = match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
-                        Some(VertexAttributeValues::Float32x3(v)) => v.clone(),
-                        _ => Vec::new(),
-                    };
-                    let bounds = stl::compute_bounds(&positions);
-                    Ok((mesh, bounds))
-                }
-                Err(e) => Err(e),
-            }
-        });
-        let file2 = file.clone();
-        *job = LoadingJob::InProgress { _file: file2, task };
-    }
-}
-
-fn poll_loading_job(
-    mut job: ResMut<LoadingJob>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut commands: Commands,
-    overlay: Query<Entity, With<LoadingOverlay>>,
-) {
-    // Handle cancelled state by clearing overlay and going idle
-    if let LoadingJob::Cancelled = &*job {
-        if let Ok(e) = overlay.get_single() { commands.entity(e).despawn_recursive(); }
-        *job = LoadingJob::Idle;
-        return;
-    }
-    if let LoadingJob::InProgress { _file: _, task } = &mut *job {
-        if let Some(result) = block_on(poll_once(task)) {
-            // Remove overlay
-            if let Ok(e) = overlay.get_single() { commands.entity(e).despawn_recursive(); }
-            match result {
-                Ok((mesh, (min, max))) => {
-                    let h = meshes.add(mesh);
-                    let mat = materials.add(StandardMaterial { base_color: Color::rgb_u8(210, 210, 210), perceptual_roughness: 0.8, metallic: 0.02, ..Default::default() });
-                    let _ent = commands.spawn((
-                        PbrBundle { mesh: h, material: mat, transform: Transform::from_xyz(0.0, 0.0, 0.0), ..Default::default() },
-                        ModelBounds { min, max },
-                        Selectable,
-                        Selected,
-                    )).id();
-                    *job = LoadingJob::Idle;
-                }
-                Err(err) => {
-                    eprintln!("Failed to load STL: {err}");
-                    *job = LoadingJob::Idle;
-                }
-            }
-        }
-    }
-}
-
-fn spawn_loading_overlay(commands: &mut Commands, file: &PathBuf) {
-    let file_name = file.file_name().and_then(|s| s.to_str()).unwrap_or("(file)");
-    // Fullscreen overlay centered container
-    commands
-        .spawn((
-            NodeBundle {
-                style: Style {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(0.0),
-                    right: Val::Px(0.0),
-                    top: Val::Px(0.0),
-                    bottom: Val::Px(0.0),
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::Center,
-                    ..default()
-                },
-                background_color: BackgroundColor(Color::rgba(0.0, 0.0, 0.0, 0.2)),
-                ..default()
-            },
-            LoadingOverlay,
-        ))
-        .with_children(|root| {
-            // The dialog panel
-            root
-                .spawn(NodeBundle {
-                    style: Style {
-                        width: Val::Px(320.0),
-                        height: Val::Px(140.0),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        flex_direction: FlexDirection::Column,
-                        row_gap: Val::Px(10.0),
-                        ..default()
-                    },
-                    background_color: BackgroundColor(Color::rgba(0.08, 0.08, 0.1, 0.95)),
-                    ..default()
-                })
-                .with_children(|p| {
-                    p.spawn((
-                        TextBundle::from_section(
-                            format!("Loading {file_name}"),
-                            TextStyle { font_size: 16.0, color: Color::WHITE, ..default() },
-                        ),
-                        LoadingFileText,
-                    ));
-
-                    // Progress bar background
-                    p.spawn(NodeBundle {
-                        style: Style { width: Val::Px(260.0), height: Val::Px(12.0), ..default() },
-                        background_color: BackgroundColor(Color::rgb_u8(60, 60, 60)),
-                        ..default()
-                    })
-                    .with_children(|p2| {
-                        // Fill
-                        p2.spawn((
-                            NodeBundle {
-                                style: Style { width: Val::Px(0.0), height: Val::Percent(100.0), ..default() },
-                                background_color: BackgroundColor(Color::rgb_u8(180, 200, 255)),
-                                ..default()
-                            },
-                            LoadingBarFill,
-                        ));
-                    });
-
-                    // Cancel button
-                    p.spawn((
-                        ButtonBundle {
-                            style: Style { padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)), ..default() },
-                            background_color: BackgroundColor(Color::rgb_u8(120, 40, 40)),
-                            ..default()
-                        },
-                        CancelButton,
-                    ))
-                    .with_children(|b| {
-                        b.spawn(TextBundle::from_section(
-                            "Cancel",
-                            TextStyle { font_size: 14.0, color: Color::WHITE, ..default() },
-                        ));
-                    });
-                });
-        });
-}
-
-fn update_loading_ui(
-    time: Res<Time>,
-    mut bar: Query<&mut Style, With<LoadingBarFill>>,
-    mut btns: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<CancelButton>)>,
-    mut job: ResMut<LoadingJob>,
-    overlay: Query<Entity, With<LoadingOverlay>>,
-) {
-    // Indeterminate animation: smooth loop from 40px..240px
-    if let Ok(mut style) = bar.get_single_mut() {
-        let t = time.elapsed_seconds();
-        let phase = ((t * 0.6) % 1.0) as f32; // 0..1 sawtooth
-        style.width = Val::Px(40.0 + 200.0 * phase);
-    }
-
-    for (interaction, mut color) in btns.iter_mut() {
-        match *interaction {
-            Interaction::Pressed => {
-                *color = BackgroundColor(Color::rgb_u8(160, 60, 60));
-                // Cancel job and remove overlay
-                *job = LoadingJob::Cancelled;
-                if overlay.get_single().is_ok() { /* overlay removal handled next frame */ }
-            }
-            Interaction::Hovered => *color = BackgroundColor(Color::rgb_u8(140, 50, 50)),
-            Interaction::None => *color = BackgroundColor(Color::rgb_u8(120, 40, 40)),
-        }
-    }
-}
+// old loading overlay/job systems removed
 
 // camera controls moved to camera.rs
 
@@ -646,44 +464,64 @@ fn update_fps_ui(time: Res<Time>, mut fps: ResMut<FpsCounter>, mut q: Query<&mut
 #[derive(Resource)]
 struct LoadedDefault(bool);
 
-#[derive(Component)]
-struct LoadingOverlay;
-#[derive(Component)]
-struct LoadingBarFill;
-#[derive(Component)]
-struct LoadingFileText;
-#[derive(Component)]
-struct CancelButton;
+// (Removed) Loading overlay and job machinery; asset server handles reloads
 
-#[derive(Resource)]
-enum LoadingJob {
-    Idle,
-    Pending { file: PathBuf },
-    InProgress { _file: PathBuf, task: Task<anyhow::Result<(Mesh, (Vec3, Vec3))>> },
-    Cancelled,
-}
-
-fn schedule_default_load_once(mut loaded: ResMut<LoadedDefault>, mut job: ResMut<LoadingJob>, mut current: ResMut<CurrentModelPath>) {
+fn schedule_default_asset_load_once(
+    mut loaded: ResMut<LoadedDefault>,
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    mut current: ResMut<CurrentModelPath>,
+) {
     if loaded.0 { return; }
-    let path = PathBuf::from("assets/sample.stl");
-    if path.exists() {
-        *job = LoadingJob::Pending { file: path };
-        loaded.0 = true; // ensure we only schedule once
-        current.0 = Some(PathBuf::from("assets/sample.stl"));
+    let fs_path = std::path::Path::new("assets/sample.stl");
+    if fs_path.exists() {
+        let handle: Handle<stl::StlMesh> = assets.load("sample.stl");
+        commands.spawn((StlInstance { handle: handle.clone() }, Selectable));
+        current.0 = Some(fs_path.to_path_buf());
+        loaded.0 = true;
     }
 }
 
-fn stl_file_drop_loader(
+fn stl_file_drop_loader_assets(
     mut ev: EventReader<FileDragAndDrop>,
-    mut job: ResMut<LoadingJob>,
+    assets: Res<AssetServer>,
+    mut commands: Commands,
     mut current: ResMut<CurrentModelPath>,
 ) {
     for e in ev.read() {
         if let FileDragAndDrop::DroppedFile { path_buf, .. } = e {
             if path_buf.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("stl")).unwrap_or(false) {
-                current.0 = Some(path_buf.clone());
-                *job = LoadingJob::Pending { file: path_buf.clone() };
+                // Ingest into assets/imports for AssetServer to watch/reload
+                let file_name = path_buf.file_name().and_then(|s| s.to_str()).unwrap_or("dropped.stl");
+                let rel_path = format!("imports/{}", file_name);
+                let dst_fs_path = std::path::Path::new("assets").join(&rel_path);
+                let _ = std::fs::create_dir_all(dst_fs_path.parent().unwrap());
+                let _ = std::fs::copy(&path_buf, &dst_fs_path);
+
+                let handle: Handle<stl::StlMesh> = assets.load(rel_path.clone());
+                commands.spawn((StlInstance { handle: handle.clone() }, Selectable, Selected));
+                current.0 = Some(dst_fs_path);
             }
+        }
+    }
+}
+
+fn stl_instantiate_ready(
+    stl_assets: Res<Assets<stl::StlMesh>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut commands: Commands,
+    q: Query<(Entity, &StlInstance), Without<Handle<Mesh>>>,
+) {
+    for (ent, inst) in &q {
+        if let Some(data) = stl_assets.get(&inst.handle) {
+            let mesh_h = meshes.add(data.to_bevy_mesh());
+            let mat = materials.add(StandardMaterial { base_color: Color::rgb_u8(210, 210, 210), perceptual_roughness: 0.8, metallic: 0.02, ..Default::default() });
+            let (min, max) = stl::compute_bounds(&data.positions);
+            commands.entity(ent).insert((
+                PbrBundle { mesh: mesh_h, material: mat, transform: Transform::from_xyz(0.0, 0.0, 0.0), ..Default::default() },
+                ModelBounds { min, max },
+            ));
         }
     }
 }

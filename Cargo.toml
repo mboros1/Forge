@@ -12,6 +12,7 @@ members = [
     "exts/slicer-prusa",
     "drivers/octoprint",
     "drivers/klipper",
+    "config",
 ]
 
 [dependencies]

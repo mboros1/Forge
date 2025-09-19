@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use forge_protocol::SlicingRequest;
 use tempfile::NamedTempFile;
 
@@ -125,4 +125,3 @@ fn prusaslicer_output_dir(req: &SlicingRequest) -> PathBuf {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| PathBuf::from("."))
 }
-
