@@ -3,6 +3,10 @@ name = "forge-exts-slicer-prusa"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "forge_exts_slicer_prusa"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

@@ -1,96 +1,50 @@
-use anyhow::Result;
-use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
 use bevy::math::primitives::Cylinder;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::window::FileDragAndDrop;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 use futures_lite::future::{poll_once, block_on};
-use std::collections::HashMap;
+use forge_protocol::{SlicingRequest, InputModel, Profile, Bed, BedOrigin, Outputs};
+use forge_exts_slicer_prusa::run_slice as run_prusa_slice;
 use std::path::PathBuf;
+mod camera;
+mod stl;
 
 // Use 10mm minor squares to cover 25x25 cm with 5x5 blocks (each block = 50mm)
-const GRID_SQUARE_MM: f32 = 10.0; // 10mm squares
-const GRID_BLOCK_SIZE: usize = 5; // 5x5 squares per block
-const GRID_BLOCKS: usize = 5; // total 5x5 blocks
+pub(crate) const GRID_SQUARE_MM: f32 = 10.0; // 10mm squares
+pub(crate) const GRID_BLOCK_SIZE: usize = 5; // 5x5 squares per block
+pub(crate) const GRID_BLOCKS: usize = 5; // total 5x5 blocks
 
-pub fn run() -> Result<()> {
-    App::new()
-        .insert_resource(ClearColor(Color::rgb_u8(20, 22, 25)))
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Forge Viewer".into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
-        .insert_resource(FpsCounter { avg: 0.0 })
-        .insert_resource(LoadedDefault(false))
-        .insert_resource(DragState::default())
-        .insert_resource(LoadingJob::Idle)
-        .add_systems(Startup, (setup_camera, spawn_axes_arrows, setup_fps_ui))
-        .add_systems(Update, (
-            draw_gizmos,
-            draw_selection_gizmos,
-            drag_selected_model,
-            camera_orbit_controls,
-            mouse_pick_select,
-            update_fps_ui,
-            stl_file_drop_loader,
-            schedule_default_load_once,
-            kick_off_loading_job,
-            poll_loading_job,
-            update_loading_ui,
-        ))
-        .run();
-    Ok(())
+pub struct ForgeViewerPlugin;
+
+impl Plugin for ForgeViewerPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(FpsCounter { avg: 0.0 })
+            .insert_resource(LoadedDefault(false))
+            .insert_resource(DragState::default())
+            .insert_resource(LoadingJob::Idle)
+            .insert_resource(CurrentModelPath(None))
+            .insert_resource(SliceJob::Idle)
+            .add_systems(Startup, (camera::setup_camera, spawn_axes_arrows, setup_fps_ui))
+            .add_systems(Update, (
+                draw_gizmos,
+                draw_selection_gizmos,
+                drag_selected_model,
+                camera::camera_orbit_controls,
+                mouse_pick_select,
+                slice_hotkey,
+                poll_slice_job,
+                update_fps_ui,
+                stl_file_drop_loader,
+                schedule_default_load_once,
+                kick_off_loading_job,
+                poll_loading_job,
+                update_loading_ui,
+            ));
+    }
 }
 
-#[derive(Component)]
-struct OrbitCamera {
-    target: Vec3,
-    distance: f32,
-    yaw: f32,
-    pitch: f32,
-}
-
-fn setup_camera(mut commands: Commands) {
-    let total_mm = GRID_SQUARE_MM * (GRID_BLOCKS * GRID_BLOCK_SIZE) as f32;
-    let center = Vec3::new(total_mm * 0.5, total_mm * 0.5, 0.0);
-    let distance = (total_mm * 2.0).max(100.0);
-
-    let yaw = -45f32.to_radians();
-    let pitch = 30f32.to_radians();
-
-    let mut cam_tf = Transform::from_translation(center + offset_from_spherical(distance, yaw, pitch));
-    cam_tf.look_at(center, Vec3::Z);
-
-    commands.spawn((
-        Camera3dBundle {
-            transform: cam_tf,
-            ..Default::default()
-        },
-        OrbitCamera {
-            target: center,
-            distance,
-            yaw,
-            pitch,
-        },
-    ));
-
-    // Basic light
-    commands.spawn((
-        DirectionalLightBundle {
-            directional_light: DirectionalLight {
-                illuminance: 10_000.0,
-                shadows_enabled: false,
-                ..Default::default()
-            },
-            transform: Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -45f32.to_radians(), 0.0, 45f32.to_radians())),
-            ..Default::default()
-        },
-    ));
-}
+// camera setup moved to camera.rs
 
 fn spawn_axes_arrows(
     mut commands: Commands,
@@ -143,12 +97,7 @@ fn spawn_axes_arrows(
 
 
 
-fn offset_from_spherical(distance: f32, yaw: f32, pitch: f32) -> Vec3 {
-    let x = distance * pitch.cos() * yaw.cos();
-    let y = distance * pitch.cos() * yaw.sin();
-    let z = distance * pitch.sin();
-    Vec3::new(x, y, z)
-}
+// camera helpers moved to camera.rs
 
 fn build_cone_mesh(radius: f32, height: f32, segments: usize) -> Mesh {
     // Cone along +Y axis, base at y=0, apex at y=height
@@ -223,6 +172,69 @@ struct Selectable;
 #[derive(Component)]
 struct Selected;
 
+#[derive(Resource, Default)]
+struct CurrentModelPath(Option<PathBuf>);
+
+#[derive(Resource)]
+enum SliceJob {
+    Idle,
+    Pending { model: PathBuf },
+    InProgress { task: Task<anyhow::Result<()>> },
+}
+
+fn slice_hotkey(
+    keys: Res<ButtonInput<KeyCode>>,
+    current: Res<CurrentModelPath>,
+    mut job: ResMut<SliceJob>,
+) {
+    if keys.just_pressed(KeyCode::KeyS) {
+        if let (Some(model), true) = (&current.0, matches!(*job, SliceJob::Idle)) {
+            *job = SliceJob::Pending { model: model.clone() };
+        }
+    }
+}
+
+fn poll_slice_job(
+    mut job: ResMut<SliceJob>,
+) {
+    if let SliceJob::InProgress { task } = &mut *job {
+        if let Some(res) = block_on(poll_once(task)) {
+            if let Err(e) = res { eprintln!("Slice error: {e}"); }
+            *job = SliceJob::Idle;
+        }
+    } else if let SliceJob::Pending { model } = &*job {
+        // Kick off task
+        let model_path = model.clone();
+        let task = AsyncComputeTaskPool::get().spawn(async move { run_slice_request(model_path).await });
+        *job = SliceJob::InProgress { task };
+    }
+}
+
+async fn run_slice_request(model_path: PathBuf) -> anyhow::Result<()> {
+    use std::fs;
+    use std::process::Command;
+    // Build a simple request using provided model path
+    let stem = PathBuf::from(&model_path).file_stem().and_then(|s| s.to_str()).unwrap_or("job").to_string();
+    let out_dir = PathBuf::from("out");
+    fs::create_dir_all(&out_dir)?;
+    let req = SlicingRequest {
+        engine: "prusa-slicer".to_string(),
+        inputs: vec![InputModel { path: model_path.to_string_lossy().to_string(), transform: [
+            1.0,0.0,0.0,0.0,
+            0.0,1.0,0.0,0.0,
+            0.0,0.0,1.0,0.0,
+            0.0,0.0,0.0,1.0,
+        ]}],
+        profile: Profile { nozzle_mm: 0.4, layer_h_mm: 0.2, material: "PLA".into(), speed_preset: "standard".into() },
+        bed: Bed { size_mm: [220.0, 220.0, 250.0], origin: BedOrigin::Min },
+        outputs: Outputs { gcode: out_dir.join(format!("{}.gcode", stem)).to_string_lossy().to_string(), preview: out_dir.join("preview.json").to_string_lossy().to_string() },
+    };
+    let _ = fs::write(out_dir.join("request.json"), serde_json::to_vec_pretty(&req)?);
+    // Call adapter library (still spawns PrusaSlicer out-of-process)
+    run_prusa_slice(&req)
+}
+
+
 fn kick_off_loading_job(
     mut commands: Commands,
     mut job: ResMut<LoadingJob>,
@@ -237,9 +249,9 @@ fn kick_off_loading_job(
         // Start task
         let file_path = file.clone();
         let pool = AsyncComputeTaskPool::get();
-        let task: Task<Result<(Mesh, (Vec3, Vec3))>> = pool.spawn(async move {
+        let task: Task<anyhow::Result<(Mesh, (Vec3, Vec3))>> = pool.spawn(async move {
             // Do sync parse in async pool
-            let res = load_stl_mesh(&file_path);
+            let res = stl::load_stl_mesh(&file_path);
             match res {
                 Ok(mesh) => {
                     // Extract positions to compute bounds
@@ -248,7 +260,7 @@ fn kick_off_loading_job(
                         Some(VertexAttributeValues::Float32x3(v)) => v.clone(),
                         _ => Vec::new(),
                     };
-                    let bounds = compute_bounds(&positions);
+                    let bounds = stl::compute_bounds(&positions);
                     Ok((mesh, bounds))
                 }
                 Err(e) => Err(e),
@@ -280,12 +292,12 @@ fn poll_loading_job(
                 Ok((mesh, (min, max))) => {
                     let h = meshes.add(mesh);
                     let mat = materials.add(StandardMaterial { base_color: Color::rgb_u8(210, 210, 210), perceptual_roughness: 0.8, metallic: 0.02, ..Default::default() });
-                    commands.spawn((
+                    let _ent = commands.spawn((
                         PbrBundle { mesh: h, material: mat, transform: Transform::from_xyz(0.0, 0.0, 0.0), ..Default::default() },
                         ModelBounds { min, max },
                         Selectable,
                         Selected,
-                    ));
+                    )).id();
                     *job = LoadingJob::Idle;
                 }
                 Err(err) => {
@@ -408,75 +420,7 @@ fn update_loading_ui(
     }
 }
 
-fn camera_orbit_controls(
-    time: Res<Time>,
-    mut ev_motion: EventReader<MouseMotion>,
-    mut ev_scroll: EventReader<MouseWheel>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    drag: Res<DragState>,
-    mut q_cam: Query<(&mut Transform, &mut OrbitCamera)>,
-) {
-    // Suppress orbit while dragging a model
-    if drag.is_active() { 
-        // still handle scroll zoom
-        for ev in ev_scroll.read() {
-            let (mut tf, mut orb) = match q_cam.get_single_mut() { Ok(v) => v, Err(_) => return };
-            let scroll = match ev.unit { bevy::input::mouse::MouseScrollUnit::Line => ev.y * 50.0, bevy::input::mouse::MouseScrollUnit::Pixel => ev.y };
-            orb.distance *= (1.0 - scroll * 0.001).clamp(0.1, 10.0);
-            orb.distance = orb.distance.clamp(10.0, 10_000.0);
-            let offset = offset_from_spherical(orb.distance, orb.yaw, orb.pitch);
-            tf.translation = orb.target + offset;
-            tf.look_at(orb.target, Vec3::Z);
-        }
-        return; 
-    }
-    let (mut tf, mut orb) = match q_cam.get_single_mut() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let mut delta = Vec2::ZERO;
-    for ev in ev_motion.read() {
-        delta += ev.delta;
-    }
-
-    // Orbit with left mouse
-    if buttons.pressed(MouseButton::Left) {
-        let sens = 0.3f32;
-        orb.yaw -= delta.x.to_radians() * sens;
-        orb.pitch += delta.y.to_radians() * sens;
-        let limit = 89f32.to_radians();
-        orb.pitch = orb.pitch.clamp(-limit, limit);
-    }
-
-    // Pan with right mouse
-    if buttons.pressed(MouseButton::Right) {
-        let pan_speed = orb.distance * 0.0015;
-        // Right/Up vectors based on current yaw/pitch around Z-up
-        let forward = (orb.target - tf.translation).normalize_or_zero();
-        let right = forward.cross(Vec3::Z).normalize_or_zero();
-        let up = Vec3::Z;
-        orb.target += (-right * delta.x + up * delta.y) * pan_speed;
-    }
-
-    // Zoom with scroll
-    for ev in ev_scroll.read() {
-        let scroll = match ev.unit {
-            bevy::input::mouse::MouseScrollUnit::Line => ev.y * 50.0,
-            bevy::input::mouse::MouseScrollUnit::Pixel => ev.y,
-        };
-        orb.distance *= (1.0 - scroll * 0.001).clamp(0.1, 10.0);
-        orb.distance = orb.distance.clamp(10.0, 10_000.0);
-    }
-
-    // Recompute camera transform
-    let offset = offset_from_spherical(orb.distance, orb.yaw, orb.pitch);
-    tf.translation = orb.target + offset;
-    tf.look_at(orb.target, Vec3::Z);
-
-    // Small damping for nicer feel when not interacting
-    let _ = time.delta_seconds();
-}
+// camera controls moved to camera.rs
 
 #[derive(Debug, Default, Resource)]
 struct DragState { active: Option<DragData> }
@@ -715,86 +659,33 @@ struct CancelButton;
 enum LoadingJob {
     Idle,
     Pending { file: PathBuf },
-    InProgress { _file: PathBuf, task: Task<Result<(Mesh, (Vec3, Vec3))>> },
+    InProgress { _file: PathBuf, task: Task<anyhow::Result<(Mesh, (Vec3, Vec3))>> },
     Cancelled,
 }
 
-fn schedule_default_load_once(mut loaded: ResMut<LoadedDefault>, mut job: ResMut<LoadingJob>) {
+fn schedule_default_load_once(mut loaded: ResMut<LoadedDefault>, mut job: ResMut<LoadingJob>, mut current: ResMut<CurrentModelPath>) {
     if loaded.0 { return; }
     let path = PathBuf::from("assets/sample.stl");
     if path.exists() {
         *job = LoadingJob::Pending { file: path };
         loaded.0 = true; // ensure we only schedule once
+        current.0 = Some(PathBuf::from("assets/sample.stl"));
     }
 }
 
 fn stl_file_drop_loader(
     mut ev: EventReader<FileDragAndDrop>,
     mut job: ResMut<LoadingJob>,
+    mut current: ResMut<CurrentModelPath>,
 ) {
     for e in ev.read() {
         if let FileDragAndDrop::DroppedFile { path_buf, .. } = e {
             if path_buf.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("stl")).unwrap_or(false) {
+                current.0 = Some(path_buf.clone());
                 *job = LoadingJob::Pending { file: path_buf.clone() };
             }
         }
     }
 }
 
-fn load_stl_mesh(path: &PathBuf) -> Result<Mesh> {
-    use std::fs::File;
-    let mut f = File::open(path)?;
-    let mesh = stl_io::read_stl(&mut f)?;
-
-    // Build positions
-    let positions: Vec<[f32;3]> = mesh.vertices.iter().map(|v| [v[0], v[1], v[2]]).collect();
-
-    // Indices (triangles)
-    let mut indices: Vec<u32> = Vec::with_capacity(mesh.faces.len() * 3);
-    for tri in &mesh.faces {
-        indices.push(tri.vertices[0] as u32);
-        indices.push(tri.vertices[1] as u32);
-        indices.push(tri.vertices[2] as u32);
-    }
-
-    // Compute per-vertex normals from face normals
-    let mut norms_acc: HashMap<usize, Vec<Vec3>> = HashMap::new();
-    for tri in &mesh.faces {
-        let i0 = tri.vertices[0] as usize;
-        let i1 = tri.vertices[1] as usize;
-        let i2 = tri.vertices[2] as usize;
-        let p0 = Vec3::from(positions[i0]);
-        let p1 = Vec3::from(positions[i1]);
-        let p2 = Vec3::from(positions[i2]);
-        let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
-        norms_acc.entry(i0).or_default().push(n);
-        norms_acc.entry(i1).or_default().push(n);
-        norms_acc.entry(i2).or_default().push(n);
-    }
-    let mut normals: Vec<[f32;3]> = Vec::with_capacity(positions.len());
-    for i in 0..positions.len() {
-        let n = norms_acc.get(&i).map(|ns| {
-            let mut s = Vec3::ZERO;
-            for v in ns { s += *v; }
-            s.normalize_or_zero()
-        }).unwrap_or(Vec3::Y);
-        normals.push([n.x, n.y, n.z]);
-    }
-
-    let mut bevy_mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
-    bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-    bevy_mesh.insert_indices(Indices::U32(indices));
-    Ok(bevy_mesh)
-}
-
-fn compute_bounds(positions: &[[f32;3]]) -> (Vec3, Vec3) {
-    let mut min = Vec3::splat(f32::INFINITY);
-    let mut max = Vec3::splat(f32::NEG_INFINITY);
-    for p in positions {
-        let v = Vec3::new(p[0], p[1], p[2]);
-        min = min.min(v);
-        max = max.max(v);
-    }
-    (min, max)
-}
+// STL helpers moved to stl.rs

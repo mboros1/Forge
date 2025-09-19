@@ -16,3 +16,15 @@ members = [
 
 [dependencies]
 forge-viewer = { path = "viewer" }
+bevy = { version = "0.13", default-features = false, features = [
+    "bevy_winit",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_asset",
+    "bevy_gizmos",
+    "bevy_ui",
+    "bevy_text",
+    "tonemapping_luts",
+    "multi-threaded",
+] }
