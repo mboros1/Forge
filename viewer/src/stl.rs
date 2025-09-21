@@ -1,4 +1,4 @@
-use bevy::asset::{io::Reader, AssetLoader, BoxedFuture, LoadContext, LoadedAsset};
+use bevy::asset::{io::Reader, AssetLoader, BoxedFuture, LoadContext};
 use bevy::prelude::*;
 use bevy::reflect::TypePath;
 use bevy::render::mesh::{Indices, PrimitiveTopology};

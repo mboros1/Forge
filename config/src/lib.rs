@@ -4,9 +4,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum BedOrigin { Min, Center }
+pub enum BedOrigin { #[default]
+Min, Center }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BedSpec {

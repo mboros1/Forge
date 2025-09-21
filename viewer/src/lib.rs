@@ -7,8 +7,11 @@ use futures_lite::future::{poll_once, block_on};
 use forge_protocol::{SlicingRequest, InputModel, Profile, Bed, BedOrigin, Outputs};
 use forge_exts_slicer_prusa::run_slice as run_prusa_slice;
 use std::path::PathBuf;
+use std::collections::HashMap;
 mod camera;
 mod stl;
+use bevy_egui::EguiPlugin;
+use serde::{Serialize, Deserialize};
 
 // Use 10mm minor squares to cover 25x25 cm with 5x5 blocks (each block = 50mm)
 pub(crate) const GRID_SQUARE_MM: f32 = 10.0; // 10mm squares
@@ -21,13 +24,16 @@ impl Plugin for ForgeViewerPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<stl::StlMesh>()
             .init_asset_loader::<stl::StlLoader>()
+            .init_resource::<Plates>()
             .insert_resource(FpsCounter { avg: 0.0 })
             .insert_resource(LoadedDefault(false))
             .insert_resource(DragState::default())
             .insert_resource(CurrentModelPath(None))
             .insert_resource(SliceJob::Idle)
-            .add_systems(Startup, (camera::setup_camera, spawn_axes_arrows, setup_fps_ui))
+            .add_plugins(EguiPlugin)
+            .add_systems(Startup, (create_initial_plate, camera::setup_camera, spawn_axes_arrows))
             .add_systems(Update, (
+                tabs_ui,
                 draw_gizmos,
                 draw_selection_gizmos,
                 drag_selected_model,
@@ -36,9 +42,11 @@ impl Plugin for ForgeViewerPlugin {
                 stl_instantiate_ready,
                 slice_hotkey,
                 poll_slice_job,
-                update_fps_ui,
+                update_fps_ema,
+                fps_overlay_egui,
                 stl_file_drop_loader_assets,
                 schedule_default_asset_load_once,
+                save_session_on_exit,
             ));
     }
 }
@@ -176,6 +184,129 @@ struct CurrentModelPath(Option<PathBuf>);
 
 #[derive(Component, Clone)]
 struct StlInstance { handle: Handle<stl::StlMesh> }
+
+#[derive(Component, Clone)]
+struct SourcePath(pub String);
+
+// Plates (tabs)
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct PlateId(u32);
+
+#[derive(Component)]
+struct PlateRoot(PlateId);
+
+#[derive(Clone)]
+struct PlateState {
+    name: String,
+    root: Entity,
+    // placeholder config bindings per plate
+    printer_id: String,
+    filament_id: String,
+    print_id: String,
+}
+
+#[derive(Resource, Default)]
+struct Plates {
+    active: Option<PlateId>,
+    next_id: u32,
+    list: HashMap<PlateId, PlateState>,
+}
+
+fn create_initial_plate(mut commands: Commands, mut plates: ResMut<Plates>) {
+    if plates.active.is_some() { return; }
+    let id = PlateId(plates.next_id); plates.next_id += 1;
+    let root = commands.spawn((SpatialBundle::default(), PlateRoot(id), Name::new("Plate Root"))).id();
+    let state = PlateState {
+        name: format!("Plate {}", id.0 + 1),
+        root,
+        printer_id: "default_printer".into(),
+        filament_id: "default_filament".into(),
+        print_id: "normal_0p2".into(),
+    };
+    plates.list.insert(id, state);
+    plates.active = Some(id);
+}
+
+fn tabs_ui(
+    mut ctxs: bevy_egui::EguiContexts,
+    mut plates: ResMut<Plates>,
+    mut roots: Query<(&PlateRoot, &mut Visibility)>,
+    mut commands: Commands,
+) {
+    use bevy_egui::egui;
+    let ctx = ctxs.ctx_mut();
+    egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            let ids: Vec<PlateId> = plates.list.keys().copied().collect();
+            let mut to_close: Option<PlateId> = None;
+            for id in ids {
+                let name = plates.list.get(&id).map(|p| p.name.clone()).unwrap_or_else(|| "Plate".into());
+                let selected = plates.active == Some(id);
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(selected, name).clicked() {
+                            plates.active = Some(id);
+                            for (PlateRoot(pid), mut vis) in roots.iter_mut() {
+                                *vis = if *pid == id { Visibility::Visible } else { Visibility::Hidden };
+                            }
+                        }
+                        if ui.button("✕").clicked() {
+                            to_close = Some(id);
+                        }
+                    });
+                });
+            }
+            if ui.button("+").clicked() {
+                let id = PlateId(plates.next_id); plates.next_id += 1;
+                let root = commands.spawn((SpatialBundle::default(), PlateRoot(id), Name::new("Plate Root"))).id();
+                let state = PlateState {
+                    name: format!("Plate {}", id.0 + 1),
+                    root,
+                    printer_id: "default_printer".into(),
+                    filament_id: "default_filament".into(),
+                    print_id: "normal_0p2".into(),
+                };
+                plates.list.insert(id, state);
+                plates.active = Some(id);
+                for (PlateRoot(pid), mut vis) in roots.iter_mut() {
+                    *vis = if *pid == id { Visibility::Visible } else { Visibility::Hidden };
+                }
+            }
+
+            // Handle close after drawing all tabs to avoid mutating while iterating
+            if let Some(close_id) = to_close {
+                if let Some(state) = plates.list.remove(&close_id) {
+                    // Despawn the entire plate subtree
+                    commands.entity(state.root).despawn_recursive();
+                }
+                // Pick a new active plate
+                if plates.active == Some(close_id) {
+                    plates.active = plates.list.keys().copied().next();
+                }
+                // If no plates remain, create a new one
+                if plates.list.is_empty() {
+                    let id = PlateId(plates.next_id); plates.next_id += 1;
+                    let root = commands.spawn((SpatialBundle::default(), PlateRoot(id), Name::new("Plate Root"))).id();
+                    let state = PlateState {
+                        name: format!("Plate {}", id.0 + 1),
+                        root,
+                        printer_id: "default_printer".into(),
+                        filament_id: "default_filament".into(),
+                        print_id: "normal_0p2".into(),
+                    };
+                    plates.list.insert(id, state);
+                    plates.active = Some(id);
+                }
+                // Update visibility according to the new active
+                if let Some(active_id) = plates.active {
+                    for (PlateRoot(pid), mut vis) in roots.iter_mut() {
+                        *vis = if *pid == active_id { Visibility::Visible } else { Visibility::Hidden };
+                    }
+                }
+            }
+        });
+    });
+}
 
 #[derive(Resource)]
 enum SliceJob {
@@ -428,37 +559,27 @@ fn draw_selection_gizmos(mut gizmos: Gizmos, q: Query<(&GlobalTransform, &ModelB
     }
 }
 
-#[derive(Component)]
-struct FpsText;
-
 #[derive(Resource)]
 struct FpsCounter { avg: f32 }
 
-fn setup_fps_ui(mut commands: Commands) {
-    commands.spawn((
-        TextBundle::from_sections([
-            TextSection::new("FPS: ", TextStyle { font_size: 14.0, color: Color::WHITE, ..Default::default() }),
-            TextSection::new("--", TextStyle { font_size: 14.0, color: Color::YELLOW, ..Default::default() }),
-        ])
-        .with_style(Style {
-            position_type: PositionType::Absolute,
-            left: Val::Px(10.0),
-            top: Val::Px(8.0),
-            ..Default::default()
-        }),
-        FpsText,
-    ));
-}
-
-fn update_fps_ui(time: Res<Time>, mut fps: ResMut<FpsCounter>, mut q: Query<&mut Text, With<FpsText>>) {
+fn update_fps_ema(time: Res<Time>, mut fps: ResMut<FpsCounter>) {
+    // Use Bevy's smoothed delta to reduce jitter, then apply a deeper EMA window.
     let dt = time.delta_seconds().max(1e-6);
     let inst = 1.0 / dt;
-    // exponential moving average
-    let alpha = 0.1;
+    let alpha = 0.03; // lower alpha => longer window (~33 frames)
     fps.avg = if fps.avg == 0.0 { inst } else { fps.avg * (1.0 - alpha) + inst * alpha };
-    if let Ok(mut text) = q.get_single_mut() {
-        text.sections[1].value = format!("{:.1}", fps.avg);
-    }
+}
+
+fn fps_overlay_egui(mut ctxs: bevy_egui::EguiContexts, fps: Res<FpsCounter>) {
+    use bevy_egui::egui;
+    let ctx = ctxs.ctx_mut();
+    // Pin to bottom-right with a small inset so it avoids the top tab bar and window edges
+    egui::Area::new("fps_overlay")
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-10.0, -10.0))
+        .show(ctx, |ui| {
+        let green = egui::Color32::from_rgb(0, 255, 0);
+        ui.colored_label(green, format!("FPS: {:.1}", fps.avg));
+    });
 }
 
 #[derive(Resource)]
@@ -471,12 +592,25 @@ fn schedule_default_asset_load_once(
     mut commands: Commands,
     assets: Res<AssetServer>,
     mut current: ResMut<CurrentModelPath>,
+    mut plates: ResMut<Plates>,
 ) {
     if loaded.0 { return; }
+    // If a saved session exists, load it and return
+    if let Ok(text) = std::fs::read_to_string("session.forge.json") {
+        if let Ok(sess) = serde_json::from_str::<SessionFile>(&text) {
+            let mut plates_mut = Plates { active: plates.active, next_id: plates.next_id, list: HashMap::new() };
+            restore_session(sess, &mut commands, &assets, &mut current.into_inner(), &mut plates_mut);
+            // write back plates_mut to resource
+            *plates = plates_mut;
+            loaded.0 = true;
+            return;
+        }
+    }
     let fs_path = std::path::Path::new("assets/sample.stl");
     if fs_path.exists() {
         let handle: Handle<stl::StlMesh> = assets.load("sample.stl");
-        commands.spawn((StlInstance { handle: handle.clone() }, Selectable));
+        let mut ec = commands.spawn((StlInstance { handle: handle.clone() }, Selectable, SourcePath(fs_path.to_string_lossy().to_string())));
+        if let Some(id) = plates.active { if let Some(state) = plates.list.get(&id) { ec.set_parent(state.root); } }
         current.0 = Some(fs_path.to_path_buf());
         loaded.0 = true;
     }
@@ -487,6 +621,7 @@ fn stl_file_drop_loader_assets(
     assets: Res<AssetServer>,
     mut commands: Commands,
     mut current: ResMut<CurrentModelPath>,
+    plates: Res<Plates>,
 ) {
     for e in ev.read() {
         if let FileDragAndDrop::DroppedFile { path_buf, .. } = e {
@@ -499,7 +634,8 @@ fn stl_file_drop_loader_assets(
                 let _ = std::fs::copy(&path_buf, &dst_fs_path);
 
                 let handle: Handle<stl::StlMesh> = assets.load(rel_path.clone());
-                commands.spawn((StlInstance { handle: handle.clone() }, Selectable, Selected));
+                let mut ec = commands.spawn((StlInstance { handle: handle.clone() }, Selectable, Selected, SourcePath(dst_fs_path.to_string_lossy().to_string())));
+                if let Some(id) = plates.active { if let Some(state) = plates.list.get(&id) { ec.set_parent(state.root); } }
                 current.0 = Some(dst_fs_path);
             }
         }
@@ -527,3 +663,74 @@ fn stl_instantiate_ready(
 }
 
 // STL helpers moved to stl.rs
+
+// ---------------- Session Persistence ----------------
+
+#[derive(Serialize, Deserialize)]
+struct SessionTabObject { src: String, transform: [f32; 16] }
+
+#[derive(Serialize, Deserialize)]
+struct SessionTab { id: u32, title: String, objects: Vec<SessionTabObject> }
+
+#[derive(Serialize, Deserialize)]
+struct SessionFile { schema: String, active: Option<u32>, tabs: Vec<SessionTab> }
+
+fn save_session_on_exit(
+    mut exit_ev: EventReader<bevy::app::AppExit>,
+    plates: Res<Plates>,
+    q_objs: Query<(&Transform, &Parent, Option<&SourcePath>), With<StlInstance>>,
+) {
+    if exit_ev.is_empty() { return; }
+    let mut tabs: Vec<SessionTab> = Vec::new();
+    for (id, state) in plates.list.iter() {
+        let mut objects: Vec<SessionTabObject> = Vec::new();
+        for (tf, parent, src) in q_objs.iter() {
+            if parent.get() == state.root {
+                let mat = tf.compute_matrix().to_cols_array();
+                let src_str = src.map(|s| s.0.clone()).unwrap_or_default();
+                objects.push(SessionTabObject { src: src_str, transform: mat });
+            }
+        }
+        tabs.push(SessionTab { id: id.0, title: state.name.clone(), objects });
+    }
+    let session = SessionFile { schema: "forge-session@1".into(), active: plates.active.map(|p| p.0), tabs };
+    let _ = std::fs::write("session.forge.json", serde_json::to_vec_pretty(&session).unwrap_or_default());
+}
+
+fn restore_session(sess: SessionFile, commands: &mut Commands, assets: &AssetServer, current: &mut CurrentModelPath, plates: &mut Plates) {
+    plates.list.clear();
+    plates.next_id = 0;
+    for tab in sess.tabs {
+        let id = PlateId(tab.id);
+        plates.next_id = plates.next_id.max(id.0 + 1);
+        let root = commands.spawn((SpatialBundle::default(), PlateRoot(id), Name::new(tab.title.clone()))).id();
+        let state = PlateState { name: tab.title.clone(), root, printer_id: "default_printer".into(), filament_id: "default_filament".into(), print_id: "normal_0p2".into() };
+        plates.list.insert(id, state);
+        for obj in tab.objects {
+            // Determine asset path
+            let (handle, src_for_component) = if obj.src.starts_with("assets/") {
+                let rel_owned = obj.src.clone();
+                let rel2 = rel_owned[7..].to_string();
+                (assets.load::<stl::StlMesh>(rel2), obj.src.clone())
+            } else if std::path::Path::new(&obj.src).exists() {
+                // Copy into assets/imports
+                let fname = std::path::Path::new(&obj.src).file_name().and_then(|s| s.to_str()).unwrap_or("restored.stl");
+                let rel = format!("imports/{}", fname);
+                let dst = std::path::Path::new("assets").join(&rel);
+                let _ = std::fs::create_dir_all(dst.parent().unwrap());
+                let _ = std::fs::copy(&obj.src, &dst);
+                (assets.load::<stl::StlMesh>(rel), dst.to_string_lossy().to_string())
+            } else {
+                continue;
+            };
+            let mut ec = commands.spawn((StlInstance { handle }, Selectable, SourcePath(src_for_component)));
+            ec.set_parent(root);
+            // Apply transform
+            let m = Mat4::from_cols_array(&obj.transform);
+            let (scale, rot, trans) = m.to_scale_rotation_translation();
+            ec.insert(Transform { translation: trans, rotation: rot, scale });
+            *current = CurrentModelPath(Some(std::path::PathBuf::from(obj.src.clone())));
+        }
+    }
+    plates.active = sess.active.map(PlateId);
+}

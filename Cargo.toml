@@ -5,13 +5,9 @@ edition = "2024"
 
 [workspace]
 members = [
-    "core",
     "viewer",
-    "ext-host",
     "protocol",
     "exts/slicer-prusa",
-    "drivers/octoprint",
-    "drivers/klipper",
     "config",
 ]
 
@@ -28,4 +24,5 @@ bevy = { version = "0.13", default-features = false, features = [
     "bevy_text",
     "tonemapping_luts",
     "multi-threaded",
+    "file_watcher",
 ] }
